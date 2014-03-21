@@ -1,7 +1,8 @@
 #define DEBUG_TYPE "mxpa_lva"
 
+#include "llvm/ADT/SCCIterator.h"
 #include "llvm/Support/Debug.h"
-
+#include "llvm/Support/CFG.h"
 // MXPA
 #include "LVA.h"
 
@@ -103,32 +104,106 @@ namespace LLVMPractice {
   
   BitVector LiveVariableAnalysis::getMaskPhiValues(BasicBlock *phiBlock)
   {
-    
+    BitVector mask = BitVector(instToLatticeBit.size(), true);
+    for (BasicBlock::iterator instIt = phiBlock->begin(); instIt != phiBlock->end(); instIt++) {
+      if (!isa<PHINode>(&*instIt))
+        continue;
+        PHINode *phiNode = dyn_cast<PHINode>(&*instIt);
+        for (unsigned crtIncomingIdx = 0; crtIncomingIdx < phiNode->getNumIncomingValues(); crtIncomingIdx++) {
+            Value *crtValue = phiNode->getIncomingValue(crtIncomingIdx);
+            Instruction *crtInst = dyn_cast<Instruction>(crtValue);
+            if (!crtInst) continue;
+            BasicBlock *defBlock = crtInst->getParent();
+
+            // check if the incoming value is only used in a phi instr
+            bool usedInNonPhi = false;
+            for (Value::use_iterator useIt = crtInst->use_begin(); useIt !=
+                    crtInst->use_end(); useIt++) {
+                Instruction *useInst = dyn_cast<Instruction>(*useIt);
+                if (!useInst) continue;
+                BasicBlock *useBlock = useInst->getParent();
+                // use/def in the same basic block hides upwards use
+                if (useBlock == defBlock) continue;
+                // ignore phi uses
+                if (isa<PHINode>(useInst)) continue;
+                // should be in the same basic block as phi
+                if (useBlock != phiBlock) continue;
+
+                usedInNonPhi = true;
+            }
+
+            if (!usedInNonPhi) {
+                mask.reset( getLatticeBit(crtValue) );
+            }
+        }
+    }
+    return mask; 
   
   }
   
   void LiveVariableAnalysis::initMask(FlowMask &mask, Function &F)
   {
-  
+     for (Function::iterator blockIt = F.begin(); blockIt != F.end(); blockIt++) {
+        BasicBlock *phiBlock = blockIt;
+
+        BitVector initialMask = getMaskPhiValues(phiBlock);
+
+        // now that we have masked out all the phi dependent uses, create a mask
+        // for each crtBlock -> phiBlock control flow
+        // ie.  %i = phi i32 [ %b, %bb1 ], [ %c, %bb2 ]
+        // we should change the mask for %b to 1 for %bb1 -> phiBlock
+        // and leave the mask for %b at 0 for %bb2 -> phiBlock
+        for (BasicBlock::iterator instIt = phiBlock->begin(); instIt != phiBlock->end(); instIt++) {
+            if (!isa<PHINode>(&*instIt))
+                continue;
+            PHINode *phiNode = dyn_cast<PHINode>(&*instIt);
+            for (unsigned crtIncomingIdx = 0; crtIncomingIdx < phiNode->getNumIncomingValues(); crtIncomingIdx++) {
+                BasicBlock *crtBlock = phiNode->getIncomingBlock(crtIncomingIdx);
+                Value *crtValue = phiNode->getIncomingValue(crtIncomingIdx);
+                if (!isa<Instruction>(crtValue)) continue;
+                std::pair<BasicBlock *, BasicBlock *> maskKey = std::make_pair(crtBlock, phiBlock);
+                std::map<std::pair<BasicBlock *, BasicBlock *>, BitVector *>::iterator maskIt =
+                    mask.find(maskKey);
+                if (maskIt == mask.end()) {
+                    mask[maskKey] = new BitVector(initialMask);
+                }
+                mask[maskKey]->set(getLatticeBit(crtValue));
+            }
+        }
+    } 
   }
   
   void LiveVariableAnalysis::printBitVector(BitVector *bv)
   {
-  
+    for (int i = 0; i < bv->size(); ++i)
+    {
+      errs() << (bv->test(i) ? '1' : '0');
+    }
   }
   
   void LiveVariableAnalysis::printBitVectorDetailed(BitVector *bv)
   {
-  
+     for (unsigned bit = 0; bit < bv->size(); bit++) {
+        Value *instr = 0;
+        for (LatticeEncoding::iterator it = instToLatticeBit.begin(); it !=
+                instToLatticeBit.end(); it++) {
+            if (it->second == bit) {
+                instr = it->first;
+            }
+        }
+        assert(instr);
+        dbgs() << (bv->test(bit) ? '1' : '0') << " - " << *instr << "\n";
+    } 
   }
   
-  static RegisterPass<LiveVariableAnalysis> X("mxpa_lva", "Live Variable Analysis");
+  static RegisterPass<LiveVariableAnalysis> X("practice_lva", "Live Variable Analysis");
   
   char LiveVariableAnalysis::ID = 0;
   
   bool LiveVariableAnalysis::doInitialization(Module &M) 
   {
-  
+    Mod = &M;
+    return false;
   }
 
   bool LiveVariableAnalysis::runOnFunction(Function &F)
@@ -156,12 +231,49 @@ namespace LLVMPractice {
     }
     initBlocksUse(F);
 
+    //4. Flowmask
+    FlowMask mask;
+    initMask(mask, F);
 
-    
+    // compute fixed-point liveness information - no sorting of
+    // blocks in quasi-topological order, works anyway
+    bool inChanged = true;
+    while (inChanged) {
+        inChanged = false;
+        // out[B] = U(in[S] & mask[B][S]) where B < S
+        for (Function::iterator B = F.begin(); B != F.end(); B++) {
+            (blockToInfo[B]->out)->reset();
+            for (succ_iterator succIt = succ_begin(B); succIt != succ_end(B); succIt++) {
+                BasicBlock *S = *succIt;
+                std::pair<BasicBlock *, BasicBlock *> key =
+                    std::make_pair(B, S);
+                if (mask.find(key) != mask.end()) {
+                    *(blockToInfo[B]->out) |= (*(blockToInfo[S]->in) & *(mask[key]));
+                } else {
+                    *(blockToInfo[B]->out) |= *(blockToInfo[S]->in);
+                }
+            }
+            // in[B] = use[B] U (out[B] - def[B])
+            BitVector oldIn = *(blockToInfo[B]->in);
+            *(blockToInfo[B]->in) = (*(blockToInfo[B]->use) | (*(blockToInfo[B]->out) & ~(*(blockToInfo[B]->def))));
+            if (*(blockToInfo[B]->in) != oldIn) {
+                inChanged = true;
+            }
+        }
+    }
+
+    for (FlowMask::iterator i = mask.begin(), e = mask.end(); i != e; ++i) {
+        delete i->second;
+    }
+
+    return true;
   }
 
   bool LiveVariableAnalysis::doFinalization(Module &M)
   {
-  
+    for (BlockInfoMapping::iterator it = blockToInfo.begin(); it != blockToInfo.end(); it++) {
+        delete it->second;
+    }
+    return false; 
   }
 }
