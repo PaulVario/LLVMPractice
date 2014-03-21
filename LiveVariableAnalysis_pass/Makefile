@@ -21,5 +21,5 @@ all:$(SOS)
 %.o:%.cpp %.h
 	$(CPP) -fPIC -g -c $^ $(LLVMCPPFLAGS) -Wall -D$(LLVMVER)
 clean:
-	rm -f *.so *.o *.ll *.bc *.gch
+	rm -f *.so *.o *.bc *.gch
 

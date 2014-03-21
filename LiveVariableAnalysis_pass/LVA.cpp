@@ -255,7 +255,7 @@ namespace LLVMPractice {
             }
             // in[B] = use[B] U (out[B] - def[B])
             BitVector oldIn = *(blockToInfo[B]->in);
-            *(blockToInfo[B]->in) = (*(blockToInfo[B]->use) | (*(blockToInfo[B]->out) & ~(*(blockToInfo[B]->def))));
+            //*(blockToInfo[B]->in) = (*(blockToInfo[B]->use) | (*(blockToInfo[B]->out) & ~(*(blockToInfo[B]->def))));
             if (*(blockToInfo[B]->in) != oldIn) {
                 inChanged = true;
             }
